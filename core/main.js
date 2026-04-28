@@ -1,10 +1,15 @@
-export const config = {
-  runtime: "edge",
-};
+// Vercel Edge runtime configuration — ensures execution at the Edge layer.
+export const config = { runtime: "edge" };
 
-const VX_TG = cleanOrigin(process.env.VX_TG);
+// Base URL of the upstream target; read from environment variable VX_TG.
+// Removes any trailing slash for consistent concatenation.
+const VX_TARGET_BASE = (process.env.VX_TG || "").replace(/\/$/, "");
 
-const HOP_BY_HOP_HEADERS = new Set([
+// These are HTTP header names that must NOT be forwarded upstream.
+// These are protocol-defined hop‑by‑hop headers and platform-specific headers.
+// DO NOT change the string values — behavior depends on these exact names.
+const VX_FILTERED_HEADERS = new Set([
+  "host",
   "connection",
   "keep-alive",
   "proxy-authenticate",
@@ -13,96 +18,71 @@ const HOP_BY_HOP_HEADERS = new Set([
   "trailer",
   "transfer-encoding",
   "upgrade",
-]);
-
-const DEFAULT_FORWARD_HEADERS = new Set([
-  "host",
   "forwarded",
   "x-forwarded-host",
   "x-forwarded-proto",
   "x-forwarded-port",
 ]);
 
-function cleanOrigin(raw) {
-  if (!raw) return "";
-  return raw.replace(/\/+$/, "");
-}
-
-function composeTargetURL(reqUrl) {
-  const urlObj = new URL(reqUrl);
-  return `${VX_TG}${urlObj.pathname}${urlObj.search}`;
-}
-
-function isFilteredHeader(name) {
-  const n = name.toLowerCase();
-  return (
-    HOP_BY_HOP_HEADERS.has(n) ||
-    DEFAULT_FORWARD_HEADERS.has(n) ||
-    n.startsWith("x-vercel-")
-  );
-}
-
-function cloneClientHeaders(reqHeaders) {
-  const headers = new Headers();
-  let realIp = null;
-  let forwardedIp = null;
-
-  for (const [name, value] of reqHeaders) {
-    const lower = name.toLowerCase();
-
-    if (isFilteredHeader(lower)) continue;
-
-    if (lower === "x-real-ip") {
-      realIp = value;
-      continue;
-    }
-
-    if (lower === "x-forwarded-for") {
-      forwardedIp = value;
-      continue;
-    }
-
-    headers.set(name, value);
-  }
-
-  const clientIp = realIp || forwardedIp;
-  if (clientIp) {
-    headers.set("x-forwarded-for", clientIp);
-  }
-
-  return headers;
-}
-
-function makeError(message, status = 502) {
-  return new Response(message, {
-    status,
-    headers: { "content-type": "text/plain; charset=utf-8" },
-  });
-}
-
-// Main handler renamed to "bridgeHandler"
+/**
+ * Main proxy handler — receives the incoming request on Vercel Edge
+ * and forwards it to the configured VX_TG domain.
+ */
 export default async function bridgeHandler(req) {
-  if (!VX_TG) {
-    return makeError("Misconfigured: VX_TG is not set", 500);
+  // Ensure environment variable is configured correctly.
+  if (!VX_TARGET_BASE) {
+    return new Response("Misconfigured: VX_TG is not set", { status: 500 });
   }
 
   try {
-    const upstreamUrl = composeTargetURL(req.url);
-    const forwardHeaders = cloneClientHeaders(req.headers);
-    const method = req.method.toUpperCase();
-    const hasBody = !["GET", "HEAD"].includes(method);
+    // Extract the path portion of the URL starting after protocol+domain.
+    // indexOf("/", 8) skips "https://".
+    const pathStart = req.url.indexOf("/", 8);
 
-    const response = await fetch(upstreamUrl, {
+    // Reconstruct upstream URL.
+    const targetUrl =
+      pathStart === -1
+        ? VX_TARGET_BASE + "/"
+        : VX_TARGET_BASE + req.url.slice(pathStart);
+
+    // Prepare new headers by stripping hop-by-hop and Vercel-specific headers.
+    const out = new Headers();
+    let clientIp = null;
+
+    for (const [k, v] of req.headers) {
+      if (VX_FILTERED_HEADERS.has(k)) continue;
+      if (k.startsWith("x-vercel-")) continue;
+
+      if (k === "x-real-ip") {
+        clientIp = v;
+        continue;
+      }
+
+      if (k === "x-forwarded-for") {
+        if (!clientIp) clientIp = v;
+        continue;
+      }
+
+      out.set(k, v);
+    }
+
+    // Preserve client IP chain.
+    if (clientIp) out.set("x-forwarded-for", clientIp);
+
+    // Determine whether request has a body.
+    const method = req.method;
+    const hasBody = method !== "GET" && method !== "HEAD";
+
+    // Forward request to upstream target.
+    return await fetch(targetUrl, {
       method,
-      headers: forwardHeaders,
+      headers: out,
       body: hasBody ? req.body : undefined,
-      redirect: "manual",
-      duplex: hasBody ? "half" : undefined,
+      duplex: "half", // streaming support required for Edge
+      redirect: "manual", // return upstream redirects directly
     });
-
-    return response;
   } catch (err) {
     console.error("bridge error:", err);
-    return makeError("Bad Gateway: Tunnel Failed", 502);
+    return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
   }
 }
