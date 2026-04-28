@@ -2,7 +2,7 @@
   "version": 2,
   "name": "vx-bridge",
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index" }
+    { "source": "/(.*)", "destination": "/index" }
   ],
   "trailingSlash": false
 }
